@@ -2,28 +2,29 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import yt_dlp
 import os
-import uuid
 import glob
-import threading
 import logging
+import threading
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# Carpeta principal y subcarpetas
+# Carpetas de descarga
 BASE_DIR = "downloads"
 AUDIO_DIR = os.path.join(BASE_DIR, "audio")
 VIDEO_DIR = os.path.join(BASE_DIR, "video")
-
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
-def get_ydl_options(download_type: str, folder: str, unique_id: str) -> dict:
-    """Configura yt_dlp según el tipo de descarga."""
+def get_ydl_options(download_type: str, folder: str) -> dict:
+    """Configura yt_dlp según el tipo de descarga usando título del video como nombre de archivo."""
+    # Usar ID para evitar sobrescribir si hay títulos iguales
+    outtmpl = os.path.join(folder, "%(title)s-%(id)s.%(ext)s")
+
     if download_type == "audio":
         return {
             'format': 'bestaudio/best',
-            'outtmpl': os.path.join(folder, f"{unique_id}.%(ext)s"),
+            'outtmpl': outtmpl,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
@@ -39,9 +40,9 @@ def get_ydl_options(download_type: str, folder: str, unique_id: str) -> dict:
         }
     else:
         return {
-            'format': 'bestvideo+bestaudio/best',  # fusiona video+audio
+            'format': 'bestvideo+bestaudio/best',
             'merge_output_format': 'mp4',
-            'outtmpl': os.path.join(folder, f"{unique_id}.%(ext)s"),
+            'outtmpl': outtmpl,
             'quiet': True,
             'no_warnings': True,
             'ignoreerrors': True,
@@ -61,28 +62,26 @@ def download_media(
     url: str = Query(..., description="URL de YouTube"),
     type: str = Query("video", regex="^(video|audio)$", description="Tipo de descarga: 'video' o 'audio'")
 ):
-    unique_id = str(uuid.uuid4())
     folder = AUDIO_DIR if type == "audio" else VIDEO_DIR
     media_type = "audio/mpeg" if type == "audio" else "video/mp4"
-
-    ydl_opts = get_ydl_options(type, folder, unique_id)
+    ydl_opts = get_ydl_options(type, folder)
 
     try:
         logging.info(f"Iniciando descarga: {url}")
 
-        # Descargar en hilo separado para no bloquear la API
+        # Descargar en hilo para no bloquear la API
         thread = threading.Thread(target=download_file, args=(url, ydl_opts))
         thread.start()
         thread.join()
 
         # Buscar el archivo descargado
-        files = glob.glob(os.path.join(folder, f"{unique_id}.*"))
+        files = glob.glob(os.path.join(folder, "*"))
         if not files:
             raise HTTPException(status_code=500, detail="Archivo descargado no encontrado")
 
-        filename = files[0]
+        # Tomamos el archivo más reciente
+        filename = max(files, key=os.path.getctime)
 
-        # StreamingResponse para enviar archivo grande al cliente
         def iterfile():
             with open(filename, "rb") as f:
                 while chunk := f.read(1024*1024):  # 1 MB por bloque
@@ -90,7 +89,7 @@ def download_media(
 
         logging.info(f"Descarga completada: {filename}")
         return StreamingResponse(iterfile(), media_type=media_type, headers={
-            "Content-Disposition": f"attachment; filename=download.{filename.split('.')[-1]}"
+            "Content-Disposition": f"attachment; filename={os.path.basename(filename)}"
         })
 
     except Exception as e:
